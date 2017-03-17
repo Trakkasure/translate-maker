@@ -1,147 +1,163 @@
-import Translation from './Translation';
-import * as filters from './filters';
 import isPlainObject from 'lodash/isPlainObject';
-import keys from 'lodash/keys';
-import forOwn from 'lodash/forOwn';
+import parseLocale from 'locale-id';
+import EventEmitter from 'events';
+import Tree from './Tree';
+import baseFilters from './filters';
 import MemoryAdapter from './adapters/Memory';
 import MemoryCache from './caches/Memory';
-import EventEmitter from 'events';
 import Mode from './constants/Mode';
 
-function defaultValue(path, attrs) {
+function baseDefaultValue(path) {
   return `Missing default translation for: ${path}`;
 }
 
-const defaultOptions = {
-  locale: null, // current locale
-  locales: null, // available locales
-  namespace: null, // current namespace
-  fallbacks: {},
-  cache: new MemoryCache({}),
-  adapter: new MemoryAdapter({}),
-  defaultAdapter: MemoryAdapter,
-  dotNotation: true,
-  mode: Mode.MAIN,
-  references: true,
-  variables: true,
-  combinations: true,
-  defaultValue,
-  filters,
-};
-
 // TODO add || syntax
-
 export default class Translate extends EventEmitter {
-  constructor(options = {}, callback = () => {}) {
+  constructor(options = {}) {
     super();
 
-    this._options = {
-      ...defaultOptions,
-      ...options,
+    if (isPlainObject(options.adapter)) {
+      throw new Error('You need to use instance of adapter or data option');
+    }
+
+    const { locale, namespace, data, ...rest } = options;
+
+    if (locale || namespace) {
+      throw new Error('Use method setLocale instead of option locale and namespace');
+    }
+
+    this.options = {
+      locales: undefined, // available locales
+      cache: new MemoryCache({}),
+      adapter: new MemoryAdapter({}),
+      dotNotation: true,
+      mode: Mode.MAIN,
+      references: true,
+      variables: true,
+      combinations: true,
+      defaultValue: baseDefaultValue,
+      ...rest,
       filters: {
-        ...filters, // available filters
-        ...options.filters, // add user filters
+        ...baseFilters, // available filters
+        ...rest.filters, // add user filters
       },
     };
 
-    const { locale, adapter, defaultAdapter: DefaultAdapter } = this._options
-    if (isPlainObject(adapter)) {
-      const newAdapter = this._options.adapter = new DefaultAdapter();
-      newAdapter.rehydrate(adapter);
-    }
+    this.tree = new Tree(this);
 
-    this._translation = new Translation(this);
-
-    if (locale) {
-      this.load((err) => callback(err, this));
-    } else if (callback) {
-      callback(null, this);
+    const { adapter } = this.getOptions();
+    if (data) {
+      adapter.rehydrate(data);
     }
   }
 
-  _clear() {
-    // clear cache
-    this.getOptions().cache.clear();
-
-    // todo remove current translations
-    this._translation = new Translation(this);
-  }
-
-  _loadLocale(locale, namespace, callback = () => {}) {
-    const adapter = this.getAdapter();
-    if (!locale) {
-      return callback(new Error('Locale is undefined'));
+  clear() {
+    const { cache } = this.getOptions();
+    if (cache) {
+      cache.clear();
     }
 
-    adapter.get(locale, namespace, (err, data = {}) => {
-      if (err) {
-        return callback(err);
+    this.tree = new Tree(this);
+  }
+
+  async waitForLocale() {
+    if (!this.setLocalePromise) {
+      return;
+    }
+
+
+    await this.setLocalePromise;
+  }
+
+  setLocale(locale, namespace) {
+    this.setLocalePromise = new Promise((resolve, reject) => {
+      if (!locale) {
+        reject(new Error('Locale is undefined'));
+        return;
       }
 
       const options = this.getOptions();
-      if (namespace && namespace !== options.namespace) {
-        this.set(namespace, data);
-      } else {
-        this.set(data);
+      if (options.locales && options.locales.indexOf(locale) === -1) {
+        reject(new Error('Locale is not allowed. Setup locales'));
+        return;
       }
 
-      callback(null, data);
-    });
-  }
+      const adapter = this.getAdapter();
+      adapter.get(locale, namespace).then((data) => {
+        const sameLocale = options.locale === locale;
+        if (!sameLocale) {
+          this.clear();
 
-  load(namespace, callback = () => {}) {
-    if (typeof namespace === 'function') {
-      return this.load(null, namespace);
-    }
+          this.options = {
+            ...options,
+            locale,
+          };
+        }
 
-    const options = this.getOptions();
-    this._loadLocale(options.locale, namespace || options.namespace, callback);
-  }
+        if (namespace) {
+          this.set(namespace, data);
+        } else {
+          this.set(data);
+        }
 
-  setLocale(locale, callback = () => {}) {
-    const options = this.getOptions();
-    if (options.locale === locale) {
-      return callback(null);
-    } else if (options.locales && options.locales.indexOf(locale) === -1) {
-      return callback(new Error('Locale is not allowed. Setup locales'));
-    }
+        if (!sameLocale) {
+          this.emit('locale', locale, namespace);
+        }
 
-    this._options = {
-      ...this.getOptions(),
-      locale,
-    };
-
-    this._clear();
-    this.load((...a)=>{
-      this.emit('locale', locale);
-      callback(...a);
+        resolve(data);
+      }, reject);
     });
 
+    return this.setLocalePromise;
+  }
+
+  async loadNamespace(namespace) {
+    const options = this.getOptions();
+
+    return await this.setLocale(options.locale, namespace);
   }
 
   get(path, attrs, defaultValue) {
+    if (path === undefined || path === null) {
+      return undefined;
+    }
+
     if (isPlainObject(path)) {
       const translated = {};
-      forOwn(path, (value, key) => {
-        translated[key] = this.get(value, attrs, defaultValue, value);
+      Object.keys(path).forEach((key) => {
+        translated[key] = this.get(path[key], attrs, defaultValue);
       });
 
       return translated;
     }
 
-    return this._translation.get(path, attrs, defaultValue, path);
+    return this.tree.get(path, attrs, defaultValue);
   }
 
-  set(name, value) {
-    return this._translation.set(name, value, this);
+  set(path, value) {
+    const result = this.tree.set(path, value);
+
+    this.emit('changed');
+
+    return result;
   }
 
   getOptions() {
-    return this._options;
+    return this.options;
   }
 
   getLocale() {
     return this.getOptions().locale;
+  }
+
+  getLanguage() {
+    const locale = this.getLocale();
+    if (locale) {
+      const l = parseLocale(locale);
+      return l && l.language;
+    }
+
+    return locale;
   }
 
   getCache() {
@@ -154,10 +170,8 @@ export default class Translate extends EventEmitter {
 
   setFilter(type, fn) {
     if (isPlainObject(type)) {
-      forOwn(type, (filter, filterType) => {
-        this.setFilter(filterType, filter);
-      });
-
+      Object.keys(type).forEach(filterType =>
+        this.setFilter(filterType, type[filterType]));
       return;
     }
 
@@ -165,6 +179,8 @@ export default class Translate extends EventEmitter {
   }
 
   getFilter(type) {
-    return this.getOptions().filters[type];
+    const { filters } = this.getOptions();
+
+    return filters && filters[type];
   }
 }
